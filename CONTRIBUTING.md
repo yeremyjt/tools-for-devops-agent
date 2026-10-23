@@ -237,8 +237,11 @@ The check is rolling out gradually, so whether a violation fails the check or is
 | Exists on `main` and already has this layout | Must keep satisfying them, or the check fails |
 | Exists on `main` on the older flat `evals/` layout, and your PR **starts** moving it to this one | Must satisfy them, or the check fails — a migration has to be complete, not partial |
 | Exists on `main` on the older flat `evals/` layout, and your PR leaves it there | Reported as a warning; the check passes |
+| Sets `metadata.tier: "partner-managed"` in its `SKILL.md`, whatever its layout | Reported as a warning; the check passes |
 
 So new skills need eval results, and existing skills are only held to that once someone migrates them. Migrating one is welcome in any PR — but finish it, or use an exemption for the part you can't produce. Landing half a migration and leaving the rest would fail the next person to touch that skill, for something they didn't do, which is why the third row exists.
+
+A partner-managed skill is maintained by a partner, who can't run the skill evaluation tool, so its eval results are welcome but not required. The check still lists what's missing in its summary. A maintainer can require the results on a particular pull request with the `enforce-evals` label, described above, which also applies to partner-managed skills. Setting the tier is part of the pull request, so it's reviewed like any other change to the skill.
 
 ##### Pull requests opened before this check existed
 

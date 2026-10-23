@@ -50,12 +50,19 @@ build or is only reported:
     which this PR also leaves on that layout. Violations are reported as warnings
     only, until it is migrated.
 
-Two things can override that per pull request, checked in this order:
+A skill whose ``SKILL.md`` frontmatter sets ``metadata.tier: partner-managed`` is
+legacy whatever its layout: a partner maintains it and has no access to the skill
+evaluation tool, so its results are reported but never required. ``--strict`` does
+not change that; only the ``enforce-evals`` label does.
+
+Two things can override that per pull request, checked in this order, with the
+partner-managed tier between them:
 
   1. the ``enforce-evals`` label — every skill the PR touches is enforced,
-     whatever its mode would otherwise be, *and* every exemption those skills
-     claim is withdrawn (see below). A maintainer-only, per-PR form of
-     ``--strict`` that additionally outranks ``evals/exemptions.json``.
+     whatever its mode would otherwise be, partner-managed skills included, *and*
+     every exemption those skills claim is withdrawn (see below). A
+     maintainer-only, per-PR form of ``--strict`` that additionally outranks
+     ``evals/exemptions.json``.
   2. ``PRS_PREDATING_CHECK`` — pull requests already open when this check was
      introduced. Every skill they touch is legacy, including a skill the PR adds.
      This waives *producing* results only: a skill that already carries results at
@@ -212,6 +219,14 @@ ENFORCE_LABEL = "enforce-evals"
 EXEMPTABLE_TYPES = ("structure", "best-practices", "functional")
 EXEMPTIONS_FILENAME = "exemptions.json"
 
+# Partners maintain skills of this tier and cannot run the internal skill evaluation
+# tool, so the results of a skill that declares it are reported, never required. Only
+# the ``ENFORCE_LABEL`` overrides that. The tier is part of the PR's diff, and
+# claiming it is reviewed like any other change to the skill.
+PARTNER_TIER = "partner-managed"
+PARTNER_NOTE = "partner-managed"
+METADATA_LINE_RE = re.compile(r"^metadata:[ ]*(#.*)?$")
+
 DOCS_HINT = (
     'See the "Eval Results Layout" section of CONTRIBUTING.md for the expected '
     "evals/ layout."
@@ -225,6 +240,14 @@ PREDATES_CHECK_HINT = (
     f"results anyway, apply the `{ENFORCE_LABEL}` label to this pull request; that "
     "re-runs the check with every touched skill enforced and every exemption "
     "withdrawn."
+)
+
+# Printed when a partner-managed skill has violations, so a green check still says
+# why the missing results were let through and how a maintainer can require them.
+PARTNER_HINT = (
+    f"The skill(s) above declare `metadata.tier: {PARTNER_TIER}`, so their eval "
+    "results are reported but not required. To require them anyway, apply the "
+    f"`{ENFORCE_LABEL}` label to this pull request."
 )
 
 # Printed whenever any touched skill has an honored exemption, whatever the overall
@@ -333,6 +356,53 @@ def changed_skill_ids(repo_root: Path, base: str, head_ref: str) -> list[str]:
             continue  # not a skill directory
         ids.append(skill_id)
     return sorted(ids)
+
+
+def _yaml_scalar(raw: str) -> str:
+    """A plain or quoted single-line YAML scalar, with any trailing comment removed."""
+    raw = raw.strip()
+    if raw[:1] in ("'", '"'):
+        end = raw.find(raw[0], 1)
+        return raw[1:end] if end > 0 else ""
+    return raw.split(" #", 1)[0].strip()
+
+
+def skill_tier(skill_md: Path) -> str | None:
+    """``metadata.tier`` from a SKILL.md frontmatter, or None when it can't be read.
+
+    Read line by line, since this check has no YAML dependency. The skill publishing
+    check already holds frontmatter to plain block YAML (no flow collections,
+    anchors, tabs or duplicate keys), so the tier can only be a ``tier:`` line one
+    level under a top-level ``metadata:`` line. Anything else reads as no tier, which
+    keeps the skill's derived mode: only an unambiguous claim lifts the requirement.
+    """
+    try:
+        lines = skill_md.read_text(encoding="utf-8").split("\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if lines[0] != "---" or "---" not in lines[1:]:
+        return None
+    in_metadata, child_indent = False, None
+    for line in lines[1 : lines.index("---", 1)]:
+        stripped = line.lstrip(" ")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(stripped)
+        if indent == 0:
+            in_metadata, child_indent = bool(METADATA_LINE_RE.match(line)), None
+            continue
+        if not in_metadata:
+            continue
+        if child_indent is None:
+            child_indent = indent
+        key, sep, value = stripped.partition(":")
+        if indent == child_indent and sep and key == "tier":
+            return _yaml_scalar(value)
+    return None
+
+
+def is_partner_managed(repo_root: Path, skill_id: str) -> bool:
+    return skill_tier(repo_root / "skills" / skill_id / "SKILL.md") == PARTNER_TIER
 
 
 def _version_dirs(parent: Path) -> list[Path]:
@@ -533,13 +603,15 @@ def build_reports(
     force_reason: str | None = None,
     predates_check: bool = False,
     withdraw_exemptions: str | None = None,
+    enforce_label: bool = False,
 ) -> list[SkillReport]:
     """Validate each touched skill and resolve its mode.
 
     ``force_reason`` names whatever is forcing enforcement (``--strict`` or the
-    label) and is reported as-is; ``predates_check`` marks the pull request as one
-    opened before this check existed. Precedence is force, then predates, then
-    derived.
+    label) and is reported as-is; ``enforce_label`` says whether the label is one of
+    them; ``predates_check`` marks the pull request as one opened before this check
+    existed. Precedence is the label, then the partner-managed tier, then
+    ``--strict``, then predates, then derived.
 
     ``withdraw_exemptions`` is passed to :func:`validate_skill` unchanged and is
     independent of the mode: it decides which requirements are *checked*, while the
@@ -564,8 +636,10 @@ def build_reports(
             (repo_root / rel_dir / marker).exists() for marker in MIGRATED_MARKERS
         )
 
-        # Precedence: an explicit force wins, then a PR predating the check, then
-        # the mode derived from the skill itself.
+        # Precedence: the label wins, then the partner-managed tier, then
+        # ``--strict``, then a PR predating the check, then the mode derived from
+        # the skill itself. ``--strict`` forces the migration of skills the tool
+        # can evaluate, which a partner-managed skill is not.
         #
         # Both migration conditions survive the predating-PR case, which only waives
         # producing results that were never asked for:
@@ -581,8 +655,11 @@ def build_reports(
         #    a PR predating the check would otherwise spring. None of the PRs in
         #    ``PRS_PREDATING_CHECK`` ships any of the marker directories, so this
         #    costs them nothing.
-        if force_reason:
+        partner_managed = is_partner_managed(repo_root, skill_id)
+        if force_reason and (enforce_label or not partner_managed):
             enforced, mode_note = True, force_reason
+        elif partner_managed:
+            enforced, mode_note = False, PARTNER_NOTE
         elif predates_check and not (was_migrated or now_migrated):
             enforced, mode_note = False, "predates check"
         else:
@@ -726,7 +803,8 @@ def main(argv: list[str] | None = None) -> int:
         metavar="ID",
         help=(
             "Validate this skill id instead of deriving the list from the diff. "
-            "Repeatable; the named skills are always enforced. Useful locally."
+            "Repeatable; the named skills are enforced unless partner-managed. "
+            "Useful locally."
         ),
     )
     parser.add_argument(
@@ -791,11 +869,12 @@ def main(argv: list[str] | None = None) -> int:
         reports = []
         for s in sorted(set(args.skill)):
             violations, exemptions = validate_skill(repo_root, s, withdraw_exemptions)
+            partner_managed = is_partner_managed(repo_root, s) and not enforce_label_applied
             reports.append(
                 SkillReport(
                     id=s,
-                    enforced=True,
-                    mode_note="--skill",
+                    enforced=not partner_managed,
+                    mode_note=PARTNER_NOTE if partner_managed else "--skill",
                     violations=violations,
                     exemptions=exemptions,
                     exemptions_withdrawn=bool(withdraw_exemptions),
@@ -811,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
             force_reason,
             predates_check,
             withdraw_exemptions,
+            enforce_label_applied,
         )
 
     if not reports:
@@ -844,6 +924,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if any(r.mode_note == "predates check" and not r.ok for r in reports):
         print(f"\n{PREDATES_CHECK_HINT}", file=sys.stderr)
+
+    if any(r.mode_note == PARTNER_NOTE and not r.ok for r in reports):
+        print(f"\n{PARTNER_HINT}", file=sys.stderr)
 
     if any(r.exemptions and not r.exemptions_withdrawn for r in reports):
         print(f"\n{EXEMPTIONS_HINT}", file=sys.stderr)
