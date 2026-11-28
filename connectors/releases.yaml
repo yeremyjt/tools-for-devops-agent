@@ -35,5 +35,7 @@ connectors:
     production: 1.0.0
   - name: sumo-logic
     production: 1.1.0
+  - name: terraform
+    production: 1.0.0
   - name: wiz
     production: 1.0.3
